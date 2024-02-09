@@ -1,6 +1,6 @@
 # Online Driver License Renewal Forecast
 
-[](https://github.com/austinmyc/Driver-License-Renewal/assets/59735570/6743a3d5-d7b8-4af4-97e2-2edcc13651e0)
+![](https://github.com/austinmyc/Driver-License-Renewal/assets/59735570/6743a3d5-d7b8-4af4-97e2-2edcc13651e0)
 
 ### Background
 
