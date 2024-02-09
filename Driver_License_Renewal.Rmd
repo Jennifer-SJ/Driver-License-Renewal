@@ -1,0 +1,2060 @@
+---
+title: "Forecast: Driver License Renewal"
+author: "group 12"
+date: "2024-02-05"
+
+output: 
+  html_document:
+    code_folding: show
+    highlight: haddock
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+---
+
+**Reminder: Since the code includes the tuning process of decision tree models. It takes several hours to run all.**
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE, fig.width=8, fig.height=4)
+if(!require('pacman')) {
+  install.packages('pacman')
+}
+pacman::p_load(glmnet,fpp3, ggplot2,forecast)
+```
+
+## 1. Basic analysis
+
+### Read Data
+```{r}
+data <- readr::read_csv('transaction_data.csv')
+head(data)
+str(data)
+range(data$Date)
+```
+
+```{r}
+#data preparation
+data[,c('Date','num_of_transactions')] %>%
+  as_tsibble(index = Date) -> trans_data
+```
+
+```{r}
+#Timeplot
+trans_data %>% filter(year(Date)>=2020)%>% autoplot(num_of_transactions) + labs(title="Daily Driver License Renewal via online channel", x="Date", y='Number of transactions')
+```
+
+From the time plot of the data, we can see that there is a slight increasing trend from 2020 to the start of 2022, followed by a slight decreasing trend. Also, the series fluctuates in a large scale, indicating the variance is high. 
+
+```{r}
+trans_data %>% gg_season(num_of_transactions, period=7)
+```
+Strong weekly seasonality can be observed in the seasonal plot. In general the number is higher in Wednesday, and lower in weekend. 
+
+### Data Split
+```{r}
+
+
+#training and testing split(80:20)
+
+trans_data %>%
+  filter(year(Date) >= 2020 ) -> trans_data
+
+trans_data %>%
+  filter(Date < '2023-03-15') -> train_82
+
+trans_data %>%
+  filter(Date >= '2023-03-15') -> test_82
+
+nrow(trans_data)
+nrow(train_82)
+nrow(test_82)
+  
+```
+
+```{r}
+trans_data %>%
+  autoplot()
+```
+
+
+## 2. Benchmark
+
+```{r}
+#fit the benchmark models
+benchmark_fit <- train_82 %>%
+  model(
+    Mean = MEAN(num_of_transactions),
+    Naive = NAIVE(num_of_transactions),
+    Snaive = SNAIVE(num_of_transactions),
+    Drift = RW(num_of_transactions ~ drift())
+  )
+
+# forecast on the test data
+benchmark_fc <- benchmark_fit %>%
+  forecast(test_82)
+
+```
+
+
+
+```{r}
+# Plot the forecast data with the actual data
+benchmark_fc %>%
+  autoplot(train_82, level = NULL) +
+  ggtitle("Forecasts for daily online transactions") +
+  ylab("Number of transactions") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+```{r}
+benchmark_fc %>%
+  autoplot() +
+  ggtitle('Forecasts intervals for daily online transactions')
+#The drift method has the largest confidence interval, followed by Naive,Seasonal-Naive, and the moving average has the smallest confidence interval.
+```
+
+
+
+```{r}
+
+#Measure the performance of the fitted models on the training data
+accuracy(benchmark_fit) %>%
+  arrange(.model) %>%
+  dplyr::select(.model,.type, RMSE, MAE, MAPE)
+
+#Accuracy measures for the forecasts on the test data
+accuracy(benchmark_fc, test_82) %>%
+  arrange(.model) %>%
+  dplyr::select(.model, .type,RMSE, MAE, MAPE)
+##Seasonal naive  performs best
+
+```
+
+```{r}
+#fit the snaive model
+snaive_fit <- train_82 %>%
+  model(SNAIVE(num_of_transactions))
+
+## Plot the time plots of fitted values, the original data
+augment(snaive_fit) %>%
+  ggplot(aes(x = Date)) +
+  geom_line(aes(y = num_of_transactions, colour = "Original Data")) + # Original data
+  geom_line(aes(y = .fitted, colour = "Fitted Values"))+ # Fitted values
+  ggtitle('Fitted Values and Original Data')
+
+#forecast on the test data
+snaive_fit %>%
+  forecast(test_82) -> snaive_fc
+
+# plot the forecast with the true value
+
+snaive_fc %>%
+  autoplot(train_82)+
+  autolayer(test_82)
+
+#accuracy measure
+accuracy(snaive_fc, test_82) %>%
+  arrange(.model) %>%
+  dplyr::select(RMSE, MAE, MAPE)
+
+#residual diagnostics
+gg_tsresiduals(snaive_fit)
+
+augment(snaive_fit) %>% 
+  features(.innov,ljung_box,lag = 14,dof=0)
+```
+
+- Benchmark models provide a baseline against which the performance of more sophisticated or complex models can be compared. Therefore we use four benchmark models: moving average, Naive, Seasonal Naive and Drift method to start our time series analysis.
+
+- After evaluating the performance of different benchmark models using the RMSE, we found that the Seasonal Naive method outperformed the other models in terms of fitting the training data and forecasting on the testing data. 
+
+- The drift method has similar MAPE and RMSE values as the Naive method, and it has the worst forecasting accuracy on the testing data. This suggests that the seasonal variations in the data have a stronger influence on the future values compared to the linear trend assumed by the drift method. 
+
+- However, the ACF plot of the seasonal naive fitted model shows that there are several significant autocorrelation lags, indicating a pattern of dependence in the time series data. Additionally, the ljung_box test confirmed that the residuals of the Seasonal Naive fitted model do not exhibit characteristics of white noise. So the Seasonal Naive model does not adequately capture all the underlying dynamics and dependencies present in the data, indicating the need for further analysis and alternative modeling approaches.
+
+
+## 3. TSLM
+### 3.1  Time Plot for daily data
+```{r warning=FALSE}
+onlinets_data <- readr::read_csv("transaction_data.csv")
+
+onlinets_data <- onlinets_data |>
+  mutate(Date = as_date(Date)) |>
+  as_tsibble(index = Date)
+
+onlinets_data <- onlinets_data %>%
+  mutate(weekday = 	as.logical(weekday))
+
+onlinets_data2020 <- onlinets_data %>% 
+  filter(year(Date)>=2020)
+
+onlinets_data2020 %>%
+  pivot_longer(c(daily_rain, avg_temp, num_of_transactions, Other_num_of_trans), names_to = "Measure") %>%
+  ggplot(aes(x = Date, y = value, colour = Measure)) +
+  geom_line() +
+  facet_grid(vars(Measure), scales = "free_y") +
+  ylab("value") + xlab("Date") +
+  guides(colour="none")
+
+onlinets_data2020 %>% autoplot(num_of_transactions)
+```
+
+###3.2 Correlation scatterplot matrix
+
+```{r warning=FALSE}
+onlinets_data2020 %>%
+  GGally::ggpairs(columns = c(3,4,7,11))
+```
+
+
+The figure above is a scatterplot matrix of four variables. The first column shows the relationships between the forecast variable (number of online transactions) and each of the predictors. The scatterplots show negative relationships with `daily_rain` and `avg_temp `, and a positive relationships with `other_num_of_trans`. The strength of these relationships are shown by the correlation coefficients across the first row. The remaining scatterplots and correlation coefficients show the relationships between the predictors.
+
+
+### 3.3 Time Series Components
+
+```{r}
+dcmp <- onlinets_data2020 %>%
+  model(stl = STL(num_of_transactions))
+
+components(dcmp) |> autoplot()
+```
+
+```{r}
+components(dcmp) |>
+  as_tsibble() |>
+  autoplot(num_of_transactions, colour="gray") +
+  geom_line(aes(y=trend), colour = "#D55E00") +
+  labs(
+    title = "Daily number of online transactions"
+  )
+```
+
+* The four components are shown separately in the bottom three panels. These components can be added together to reconstruct the data shown in the top panel. Notice that there are two seasonal component `season_year` and `season_week`, corresponding to the different seasonal periods.
+
+* The grey bars to the left of each panel show the relative scales of the components. The large grey bar in the panel of trend shows that the variation in the trend component is smallest compared to the variation in the data. 
+
+### 3.4 Fit TSLM model with all predictors
+
+```{r}
+# 8:2
+onlinets_data2020 %>%
+  filter(Date < '2023-03-15') -> train_82
+onlinets_data2020 %>%
+  filter(Date >= '2023-03-15') -> test_82
+```
+
+
+First, we use all predictors to fit the linear model.
+
+```{r}
+
+fit.TSLM1 <- train_82 %>%
+  model(
+    TSLM(num_of_transactions ~ daily_rain + avg_temp + weekday + Other_num_of_trans)
+    )
+fit.TSLM1 %>% report()
+```
+
+From the result, the p-value of `daily_rain` is greater than 0.05 which means it's insignificant. Therefore, we try to remove it.
+
+### 3.5 Refit TSLM model without daily_rain
+```{r}
+fit.TSLM2 <- train_82 %>%
+  model(
+    TSLM(num_of_transactions ~ avg_temp + weekday + Other_num_of_trans)
+    )
+fit.TSLM2 %>% report()
+```
+
+From the result, all estimated coefficient is significant at 0.05 level.
+
+
+### 3.6 Fit TSLM model() with trend、season、weekday、Other_num_of_trans、avg_temp
+
+```{r}
+fit.TSLM3 <- train_82 %>%
+  model(TSLM(num_of_transactions ~ trend() + season() + Other_num_of_trans + daily_rain + avg_temp ))
+fit.TSLM3 %>% report()
+```
+
+From the result, the trend() is not significant which we also find in the STL result. Therefore, we try to remove the `trend()` in model.
+
+
+### 3.7 Fit TSLM model() with season、Other_num_of_trans、avg_temp
+```{r}
+fit.TSLM4 <- train_82 %>%
+  model(TSLM(num_of_transactions ~ season()  + Other_num_of_trans + avg_temp))
+fit.TSLM4 %>% report()
+```
+
+All coefficients are significant.
+
+###3.8 Fit a harmonic regression with trend to the data.
+
+For daily data with a weekly pattern
+```{r}
+fit.harmonic <- train_82 %>% #m=7 so we try K=1-4
+  model(
+        K1 = TSLM(num_of_transactions ~ trend()+ fourier(K = 1) + Other_num_of_trans),
+        K2 = TSLM(num_of_transactions ~ trend()+ fourier(K = 2) + Other_num_of_trans),
+        K3 = TSLM(num_of_transactions ~ trend()+ fourier(K = 3) + Other_num_of_trans),
+        K4 = TSLM(num_of_transactions ~ trend()+ fourier(K = 3) + Other_num_of_trans)
+        )
+
+```
+```{r}
+fit.harmonic %>% 
+  glance() %>% 
+  arrange(AICc) %>%
+  select(.model, adj_r_squared, AICc)
+  
+```
+
+When K becomes larger, the ability of the model to match the complexity of the pattern increases. 
+From the results, the Fourier item K = 3 has the smallest AICc. Hence, we choose the model with 3 pairs of Fourier terms.
+
+
+### 3.9 Model selection
+
+```{r}
+fit_combine <- train_82 %>% 
+  model("Fourier" = TSLM(num_of_transactions ~ trend() + fourier(K = 3) + Other_num_of_trans),
+        "Seasonal dummy" = TSLM(num_of_transactions ~ season()  + Other_num_of_trans+ avg_temp),
+        "TSLM" =TSLM(num_of_transactions ~ avg_temp + weekday + Other_num_of_trans)
+)
+
+fit_combine %>% 
+  glance() %>% 
+  arrange(AICc) %>%
+  select(.model,adj_r_squared,df,AICc,BIC)
+
+```
+
+$$
+TSLM(num\_of\_transactions ~ trend() + fourier(K = 3) + Other\_num\_of\_trans)
+$$
+
+Of the three models, the linear regression with seasonal dummies yields the best AICc.
+
+```{r}
+# Final model
+fit.TSLM.final <- train_82 %>%
+  model(
+    TSLM(num_of_transactions ~ season()  + Other_num_of_trans+ avg_temp)
+    )
+```
+
+
+Residual diagnostics
+```{r warning=FALSE}
+# Residual diagnostics
+gg_tsresiduals(fit.TSLM.final)
+```
+
+```{r}
+# Ljung box test,  seasonality, choose lag = 2*7
+augment(fit.TSLM.final) %>% 
+  features(.innov, ljung_box, lag = 14) 
+```
+
+```{r warning=FALSE}
+# forecast
+fc_TSLM <- fit.TSLM.final %>% forecast(test_82)
+
+onlinets_data2020 |>
+  autoplot(num_of_transactions) +
+  autolayer(fc_TSLM)
+
+fit.TSLM.final %>% forecast(test_82) %>% accuracy(test_82)  
+
+accuracy(fit.TSLM.final) %>%
+  arrange(.model)
+```
+
+**Summary**
+
+* The ACF plot reveals that 7 lags exceeds the significance threshold. Hence, there is some autocorrelation between residuals.
+
+* The histogram suggests that the residuals may be normal distributed.
+
+* From the Ljung-box test results, the p-values is 0. Thus, we can conclude that the residuals is not a white noise series.
+
+## 4. ETS
+
+```{r}
+data <- readr::read_csv('transaction_data.csv')
+selected_data <- data[, c("Date", "num_of_transactions")]
+selected_data <- selected_data %>% tsibble()
+data_after_remove <- selected_data %>% filter(year(Date)>=2020)
+train_data <- data_after_remove %>%
+  filter (Date < '2023-03-15') 
+test_data <- data_after_remove %>%
+  filter (Date >= '2023-03-15')
+
+# Explore the data 
+train_data %>%
+      ggplot(aes(x = Date, y = num_of_transactions)) +
+      geom_line()+ 
+      ggtitle( 'Time plot for renewed driving licenses online')
+```
+
+We can observe that there exists a slightly increasing trend first from 2020 to 2022, and after 2022 the number of renewed driving licenses online decreases. So we can apply Holt’s method and damped trend methods, try ETS(A, A, N) and ETS(A, Ad, N). In addition, the number of transactions may exist seasonality. Therefore, we can choose Holt-Winters’ additive method and multiplicative method, which are ETS(A, A, A), ETS(M, A, M) respectively. We also use auto function to find the best model. After observing the AICc, we can find that auto model has the smallest AICc, so we should choose the auto ETS model. The auto model is ETS(M, N, M).
+
+
+```{r}
+fit.ets <- train_data %>%
+  model(
+    `Holt's method` = ETS(num_of_transactions ~ error("A") +
+                       trend("A") + season("N")),
+    `Damped Holt's method` = ETS(num_of_transactions ~ error("A") +
+                       trend("Ad", phi = 0.9) + season("N")),
+     additive = ETS(num_of_transactions ~ error("A") + trend("A") +                                                season("A")),
+     multiplicative = ETS(num_of_transactions ~ error("M") + trend("A") +
+                                                season("M")),
+     auto = ETS(num_of_transactions)
+  )
+glance(fit.ets) %>% arrange(AICc)
+```
+After observe the AICc, we can find that auto model has the smallest AICc, so we should choose auto ETS model.
+
+```{r}
+fit.ets %>% 
+  select(auto) %>% 
+  report()
+```
+The auto model is ETS(M,N,M).
+
+```{r}
+fit.ets %>% select(auto) %>%  gg_tsresiduals()
+```
+```{r}
+fit.ets %>% 
+  select(auto) %>%
+  augment() %>% 
+  features(.innov, ljung_box, lag=14)
+```
+After checking the residuals, we can find that there exists some lag's ACF value lying out of the blue line(95% confidence interval), which means the residuals are auto-correlation. Ljung_box also shows that p value is smaller than 0.05, which means we should reject H0. H0 is there are no difference in the residuals. Therefore, we can conclude that the residuals exist auto-correlation.This is because ETS model may be too simple to capture all the relevant information in the time series, and we will try to use more complex model structures later.
+
+
+```{r}
+# Forecast the test set
+fc_ets <- fit.ets %>% select(auto) %>%
+  forecast(h="10 months")
+  
+
+fc_ets %>% autoplot() +
+  autolayer(data_after_remove)+ xlab("Year") 
+```
+```{r}
+fc_auto<-fit.ets %>% select(auto)
+accuracy(fc_ets, selected_data)
+accuracy(fc_auto)%>%
+arrange(.model)
+```
+
+
+## 5. ARIMA
+
+### 5.1 Transformation and difference
+
+The variance changes with the level of the series. Box-Cox transformations can stabilize the variance. The trend and seasonality indicate that the transformed time series is non-stationary. Hence, we take a seasonal difference to stabilize the mean. The lag-7 differences can handle the daily data, so that we can subtract the observation after a lag of one week. The p-value of the Kwiatkowski-Phillips-Schmidt-Shin (KPSS) test is larger than 0.05. The null hypothesis of stationarity can not be rejected. The differenced time series is stationary. After obtaining stationary series, we fit ARIMA models.
+
+```{r}
+train_82 %>% autoplot(num_of_transactions)
+```
+
+```{r}
+# box_cox transformation
+lambda <- train_82 |>
+  features(num_of_transactions, features = guerrero) |>
+  pull(lambda_guerrero)
+train_82%>%autoplot(box_cox(num_of_transactions, lambda))
+
+
+#kpss test
+train_82 %>% mutate(num_online = box_cox(num_of_transactions, lambda)) %>%
+  features(num_online, unitroot_ndiffs)
+train_82 %>% mutate(num_online = box_cox(num_of_transactions, lambda)) %>%
+  features(num_online, unitroot_nsdiffs)
+```
+
+```{r}
+# A seasonal difference first
+train_82%>%autoplot(box_cox(num_of_transactions, lambda)%>%difference(7))
+```
+
+```{r}
+#kpss test
+train_82 %>% mutate(num_online = box_cox(num_of_transactions, lambda)%>%difference(7)) %>%
+  features(num_online, unitroot_ndiffs)
+train_82 %>% mutate(num_online = box_cox(num_of_transactions, lambda)%>%difference(7)) %>%
+  features(num_online, unitroot_nsdiffs)
+
+train_82 %>%
+  features(box_cox(num_of_transactions, lambda)%>%difference(7), unitroot_kpss)
+```
+
+###5.2 Select the type of ARIMA by reading plots
+
+#### ACF and PACF
+
+```{r warning=FALSE}
+train_82 %>% gg_tsdisplay(box_cox(num_of_transactions, lambda)%>%difference(7), plot_type='partial')
+```
+
+We can try to choose the appropriate model type for ARIMA with obtained ACF and PACF plots.
+
+Since have taken a seasonal difference to eliminate the trend and the seasonality, it is reasonable to set d=0 and D=1. For seasonal lags (i.e., at lags 7, 14, 21...), it seems that the lags cut off after lag 21 on the ACF plot and are exponentially decaying on the PACF plot. Similarly, it is also possible that the lags are exponentially decaying on the ACF plot and cut off after lag 21 on the PACF plot. Hence, it is reasonable to consider PDQ (0,1,3)[7] or PDQ(3,1,0)[7]. The ACF plot shows that the non-seasonal lags are exponentially decaying. The PACF shows that the non-seasonal lags cut off after lag 4. Hence, it is reasonable to consider pdq(4,0,0).
+
+To sum up, these graphs may suggest ARIMA(4,0,0)(0,1,3)[7] or ARIMA(4,0,0)(3,1,0)[7]. Hence, we fit ARIMA four models to consider the situations with and without intercept. 
+
+We checked the p-values of the estimated coefficients of the 4 models. If the p-value of the last AR term,  MA term, SAR term, or SMA term is larger than 0.05, the number of the specific type of terms can be reduced to avoid overfitting. We will remove the corresponding term and refit the models. The model with the smallest AICc is ARIMA(3,0,0)(0,1,2)[7].
+
+The residuals almost have a mean zero and constant variance as the time plot of residuals shows. The ACF plots of the residuals show that only two lags are out of the 95% confidence interval. The p-value of ljung-box test is much larger than 0.05. There is no autocorrelation issue on the residuals. And the residual series is a white noise. The histogram of the residuals shows a normal distribution, so the prediction interval would be more accurate.
+
+
+###5.3 Fit models
+
+```{r}
+fit_arima <- train_82 |>
+  model(arima1 = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(4,0,0)+PDQ(0,1,3)),
+        arima2 = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(4,0,0)+PDQ(3,1,0)),
+        arima3 = ARIMA(box_cox(num_of_transactions, lambda) ~ 1+pdq(4,0,0)+PDQ(0,1,3)),
+        arima4 = ARIMA(box_cox(num_of_transactions, lambda) ~ 1+pdq(4,0,0)+PDQ(3,1,0)))
+
+fit_arima%>%select(arima1)%>%report()
+fit_arima%>%select(arima2)%>%report()
+fit_arima%>%select(arima3)%>%report()
+fit_arima%>%select(arima4)%>%report()
+
+fit_arima%>%select(arima1)%>%tidy()
+fit_arima%>%select(arima2)%>%tidy()
+fit_arima%>%select(arima3)%>%tidy()
+fit_arima%>%select(arima4)%>%tidy()
+
+glance(fit_arima) %>% 
+  arrange(AICc) %>%
+  select(.model,AICc)
+```
+
+```{r}
+# update
+fit_arima <- train_82 |>
+  model(arima1 = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(4,0,0)+PDQ(0,1,2)),
+        arima2 = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(3,0,0)+PDQ(3,1,0)),
+        arima3 = ARIMA(box_cox(num_of_transactions, lambda) ~ 1+pdq(4,0,0)+PDQ(0,1,2)),
+        arima4 = ARIMA(box_cox(num_of_transactions, lambda) ~ 1+pdq(3,0,0)+PDQ(3,1,0)))
+
+fit_arima%>%select(arima1)%>%report()
+fit_arima%>%select(arima2)%>%report()
+fit_arima%>%select(arima3)%>%report()
+fit_arima%>%select(arima4)%>%report()
+
+fit_arima%>%select(arima1)%>%tidy()
+fit_arima%>%select(arima2)%>%tidy()
+fit_arima%>%select(arima3)%>%tidy()
+fit_arima%>%select(arima4)%>%tidy()
+
+glance(fit_arima) %>% 
+  arrange(AICc) %>%
+  select(.model,AICc)
+```
+```{r}
+#update again
+fit_arima_1 <- train_82 |>
+  model(arima1 = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(3,0,0)+PDQ(0,1,2)),
+        arima2 = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(3,0,0)+PDQ(3,1,0)),
+        arima3 = ARIMA(box_cox(num_of_transactions, lambda) ~ 1+pdq(3,0,0)+PDQ(0,1,2)),
+        arima4 = ARIMA(box_cox(num_of_transactions, lambda) ~ 1+pdq(3,0,0)+PDQ(3,1,0)))
+
+fit_arima_1%>%select(arima1)%>%report()
+fit_arima_1%>%select(arima2)%>%report()
+fit_arima_1%>%select(arima3)%>%report()
+fit_arima_1%>%select(arima4)%>%report()
+
+fit_arima_1%>%select(arima1)%>%tidy()%>%select(.model,term,p.value)
+fit_arima_1%>%select(arima2)%>%tidy()
+fit_arima_1%>%select(arima3)%>%tidy()
+fit_arima_1%>%select(arima4)%>%tidy()
+
+glance(fit_arima_1) %>% 
+  arrange(AICc) %>%
+  select(.model,AICc)
+```
+
+
+
+Not a big difference
+
+ARIMA(3,0,0)(0,1,2)[7] w/ drift or ARIMA(3,0,0)(0,1,2)[7] is okay.
+
+```{r}
+fit_arima_1 %>%select(arima1)%>%gg_arma()
+```
+
+
+###5.4 Residuals
+ 
+```{r}
+fit_arima_1%>%select(arima1) %>% 
+  gg_tsresiduals()
+augment(fit_arima_1%>%select(arima1)) %>%
+  features(.innov, ljung_box, lag = 14, dof = 5)
+```
+
+It is a white noise.
+
+
+###5.5 fitted plot
+
+```{r}
+fit_arima_1%>%select(arima1) %>% augment() %>% 
+  ggplot(aes(x = Date))+
+  geom_line(aes(y = num_of_transactions, colour = "Actual_Data")) +
+  geom_line(aes(y = .fitted, colour = "Fitted_Values")) +
+  scale_colour_manual(values = c(Actual_Data = "black", Fitted_Values = "Red"))
+```
+
+
+
+
+
+###5.6 Forecast
+
+```{r}
+fc_trans1 <- fit_arima_1%>%select(arima1)%>%forecast(h=292)
+fc_trans1%>%autoplot(onlinets_data2020)
+fc_trans1%>%autoplot(test_82)
+```
+
+```{r}
+fc_trans1%>%accuracy(onlinets_data2020)
+```
+
+
+
+
+
+```{r}
+acc1<-fc_trans1%>%accuracy(onlinets_data2020)%>%select(.model,.type,RMSE,MAE,MPE,MAPE,MASE)
+acc1
+```
+
+### 5.7 Auto model
+
+To obtain a better model, we set stepwise = FALSE and approximation = FALSE. The ARIMA() gives a different model which is ARIMA(2,0,2)(0,1,1)[7]. The p-values of AR2, MA2, and SMA2 is smaller than 0.05. The model is not overfitting. Compared the model we select by observing the plots, this model has smaller p-value of ljung-box test. However, the residuals series of this model is still a white noise. We can use this model to make forecasts.
+
+#### fit the model
+```{r}
+fit_arima1 <- train_82 |>
+  model(auto = ARIMA(box_cox(num_of_transactions, lambda), stepwise=FALSE, approximation = FALSE))
+report(fit_arima1)
+```
+
+significant.
+
+```{r}
+fit_auto <- train_82 |>
+  model(auto=ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(2,0,2)+PDQ(0,1,1)))
+report(fit_auto)
+tidy(fit_auto)%>%select(term,p.value)
+```
+
+```{r}
+fit_auto%>%gg_arma()
+```
+
+
+
+#### residuals
+```{r}
+fit_auto%>% 
+  gg_tsresiduals()
+augment(fit_auto) %>%
+  features(.innov, ljung_box, lag = 14, dof = 5)
+```
+
+
+small p-value. still white noise
+
+
+#### fitted value
+```{r}
+fit_auto %>% augment() %>% 
+  ggplot(aes(x = Date))+
+  geom_line(aes(y = num_of_transactions, colour = "Actual_Data")) +
+  geom_line(aes(y = .fitted, colour = "Fitted_Values")) +
+  scale_colour_manual(values = c(Actual_Data = "black", Fitted_Values = "Red"))
+```
+###5.8 Forecasts
+```{r}
+fc_trans3 <- fit_auto%>%forecast(h=292)
+fc_trans3%>%autoplot(onlinets_data2020)
+fc_trans3%>%autoplot(test_82)
+```
+
+```{r}
+acc2<-fc_trans3%>%accuracy(onlinets_data2020)%>%select(.model,.type,RMSE,MAE,MPE,MAPE,MASE)
+acc2
+```
+
+### 5.9 Fourier
+
+Since we are aim to forecast based on daily data, it is more likely to have long seasonal periods. We try to use a harmonic regression approach. The long seasonal pattern is modelled using Fourier terms , and the short-term time series dynamics is handled by an ARMA error. When K=3, the optimal model ARIMA(3,1,1)(1,0,0)[7] has the smallest AICc. At the meantime, the p-values of AR3, MA1, and SAR1 are smaller than 0.05. The model is not overfitting. Since the p-values of C3_7 and S3_7 is smaller than 0.05, we can not use smaller K.
+
+```{r}
+fit.fourier1 <- train_82 %>% model(
+  `K = 1` = ARIMA(box_cox(num_of_transactions, lambda) ~ fourier(K = 1) ,stepwise=FALSE, approximation = FALSE),
+  `K = 2` = ARIMA(box_cox(num_of_transactions, lambda) ~ fourier(K = 2) ,stepwise=FALSE, approximation = FALSE),
+  `K = 3` = ARIMA(box_cox(num_of_transactions, lambda) ~ fourier(K = 3) ,stepwise=FALSE, approximation = FALSE))
+```
+
+```{r}
+glance(fit.fourier1) %>% arrange(AICc)
+fit.fourier1%>%select(`K = 1`)%>%report()
+fit.fourier1%>%select(`K = 2`)%>%report()
+fit.fourier1%>%select(`K = 3`)%>%report()
+
+fit.fourier1%>%select(`K = 3`)%>%tidy()%>%select(.model,term,p.value)
+
+```
+
+```{r}
+fit.fourier1%>%select(`K = 3`)%>%report()
+```
+
+```{r}
+fit.fourier1%>%select(`K = 3`)%>% 
+  gg_tsresiduals()
+fit.fourier1%>%select(`K = 3`)%>%augment() %>%
+  features(.innov, ljung_box, lag = 14, dof = 5)
+```
+
+```{r}
+fc_trans4 <- fit.fourier1%>%select(`K = 3`)%>%forecast(h=292)
+fc_trans4%>%autoplot(onlinets_data2020)
+fc_trans4%>%autoplot(test_82)
+fc_trans4 %>%
+  accuracy(onlinets_data2020) %>%
+  select(.model,.type,MAPE,RMSE,MAE,MASE)
+acc3<-fc_trans4%>%accuracy(onlinets_data2020)%>%select(.model,.type,RMSE,MAE,MPE,MAPE,MASE)
+acc3
+```
+
+```{r}
+fit.comparation<- train_82 |>
+  model(acf_selection = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(3,0,0)+PDQ(0,1,2)),
+        automated_selection = ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(2,0,2)+PDQ(0,1,1)),
+        fourier=ARIMA(box_cox(num_of_transactions, lambda) ~ fourier(K = 3)+pdq(3,1,1)+PDQ(1,0,0)))
+fc <- fit.comparation%>%forecast(h=292)
+
+fc %>%
+  accuracy(onlinets_data2020) %>%
+  select(.model,.type,MAPE,RMSE,MAE,MASE)
+```
+
+We can select the optimal model by comparing the MAPE,RMSE,MAE,MASE.
+
+
+## 6. VAR
+
+```{r}
+data <- readr::read_csv('transaction_data.csv', show_col_types = FALSE)
+data %>%
+  as_tsibble(index = Date) -> trans_data
+
+#training and testing split(80:20)
+
+trans_data %>%
+  filter(year(Date) >= 2020 ) -> trans_data
+
+trans_data %>%
+  filter(Date < '2023-03-15') -> train_82
+
+trans_data %>%
+  filter(Date >= '2023-03-15') -> test_82
+
+nrow(trans_data)
+nrow(train_82)
+nrow(test_82)
+
+```
+```{r}
+train_82[is.na(train_82)]<-0 #impute 0s on the NA values of other channels to perform regression
+```
+
+```{r}
+#Fit VAR model with num_of_transactions, Other_num_of_trans, with weekday & seasonality
+fitVAR <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans, weekday)),
+    bic = VAR(vars(num_of_transactions, Other_num_of_trans, weekday), ic = "bic"),
+    aicc2=VAR(vars(num_of_transactions, Other_num_of_trans, weekday), season=7),
+    bic2=VAR(vars(num_of_transactions, Other_num_of_trans, weekday), season=7, ic="bic"),
+    
+  )
+fitVAR %>% glance()
+fitVAR_noweek <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans)),
+    bic = VAR(vars(num_of_transactions, Other_num_of_trans), ic = "bic"),
+    aicc2=VAR(vars(num_of_transactions, Other_num_of_trans), season=7),
+    bic2=VAR(vars(num_of_transactions, Other_num_of_trans), season=7, ic="bic"),
+  )
+fitVAR_noweek %>% glance()
+
+```
+
+From the result we know that aicc and bic gives us the same model.
+
+```{r}
+fitVAR2 <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans, weekday))
+  )
+tidy(fitVAR2)
+```
+
+```{r}
+fitVAR2 |>
+  augment() |>
+  ACF(.innov) |>
+  autoplot()
+```
+
+Significant auto-correlations are observed, meaning that a linear model may not be able to account for the auto-correlation behind the data.
+
+```{r}
+fitVAR2 |>
+  forecast(h=292) ->fc
+fc|>autoplot()
+```
+
+```{r}
+fc$.mean[,"num_of_transactions"]->test_82$fc
+```
+
+```{r}
+test_82 %>% autoplot(fc, col='red')+autolayer(test_82, num_of_transactions) #plot predicted values against the true value
+```
+
+```{r}
+sqrt(mean((test_82$num_of_transactions - test_82$fc)^2))#calculate RMSE of the model
+```
+
+
+Since this result may be due to the fact the we imputed 0s for the weekends of other channels, lets try to impute with the mean instead to see if a better result can be obtained.
+
+```{r}
+trans_data %>%
+  filter(Date < '2023-03-15') -> train_82
+mean(train_82$Other_num_of_trans, na.rm=TRUE)-> othermean
+train_82$Other_num_of_trans[is.na(train_82$Other_num_of_trans)]<-othermean
+```
+
+```{r}
+fitVAR_mean <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans, weekday)),
+    bic = VAR(vars(num_of_transactions, Other_num_of_trans, weekday), ic = "bic"),
+    aicc2=VAR(vars(num_of_transactions, Other_num_of_trans, weekday), season=7),
+    bic2=VAR(vars(num_of_transactions, Other_num_of_trans, weekday), season=7, ic="bic"),
+    
+  )
+fitVAR_mean %>% glance()
+fitVAR_mean_noweek <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans)),
+    bic = VAR(vars(num_of_transactions, Other_num_of_trans), ic = "bic"),
+    aicc2=VAR(vars(num_of_transactions, Other_num_of_trans), season=7),
+    bic2=VAR(vars(num_of_transactions, Other_num_of_trans), season=7, ic="bic"),
+  )
+fitVAR_mean_noweek %>% glance()
+```
+
+
+```{r}
+
+fitVAR_mean2 <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans, weekday))
+  )
+tidy(fitVAR_mean2)
+```
+
+```{r}
+fitVAR_mean2 |>
+  augment() |>
+  ACF(.innov) |>
+  autoplot()
+
+```
+```{r}
+fitVAR_mean2 |>
+  forecast(h=292) ->fc2
+fc2|>autoplot()
+```
+```{r}
+fc2$.mean[,"num_of_transactions"]->test_82$fc2
+```
+
+```{r}
+test_82 %>% autoplot(fc2, col='red')+autolayer(test_82, num_of_transactions) #plot predicted values against the true value
+```
+
+```{r}
+sqrt(mean((test_82$num_of_transactions - test_82$fc2)^2))#calculate RMSE of the model
+```
+
+
+We finally try to impute the data with the previous observation.
+
+```{r}
+data %>%
+  as_tsibble(index = Date) -> trans_data2
+trans_data2 %>%
+  filter(year(Date) >= 2020 ) -> trans_data2
+for (i in 2:nrow(trans_data2)) {
+  if (is.na(trans_data2[i, 'Other_num_of_trans'])) {
+    trans_data2[i, 'Other_num_of_trans'] <- trans_data2[i - 1, 'Other_num_of_trans']
+  }
+}
+
+
+trans_data2 %>%
+  filter(Date < '2023-03-15') -> train_82
+
+trans_data2 %>%
+  filter(Date >= '2023-03-15') -> test_82
+
+nrow(trans_data2)
+nrow(train_82)
+nrow(test_82)
+```
+
+```{r}
+fitVAR_prev <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans, weekday)),
+    bic = VAR(vars(num_of_transactions, Other_num_of_trans, weekday), ic = "bic"),
+    aicc2=VAR(vars(num_of_transactions, Other_num_of_trans, weekday), season=7),
+    bic2=VAR(vars(num_of_transactions, Other_num_of_trans, weekday), season=7, ic="bic"),
+    
+  )
+fitVAR_prev %>% glance()
+fitVAR_prev_noweek <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans)),
+    bic = VAR(vars(num_of_transactions, Other_num_of_trans), ic = "bic"),
+    aicc2=VAR(vars(num_of_transactions, Other_num_of_trans), season=7),
+    bic2=VAR(vars(num_of_transactions, Other_num_of_trans), season=7, ic="bic"),
+  )
+fitVAR_prev_noweek %>% glance()
+```
+
+```{r}
+
+fitVAR_prev2 <- train_82 |>
+  model(
+    aicc = VAR(vars(num_of_transactions, Other_num_of_trans, weekday))
+  )
+tidy(fitVAR_prev2)
+```
+
+```{r}
+fitVAR_prev2 |>
+  augment() |>
+  ACF(.innov) |>
+  autoplot()
+```
+
+```{r}
+fitVAR_prev2 |>
+  forecast(h=292) ->fc3
+fc3|>autoplot()
+```
+
+```{r}
+fc3$.mean[,"num_of_transactions"]->test_82$fc3
+```
+
+```{r}
+test_82 %>% autoplot(fc3, col='red')+autolayer(test_82, num_of_transactions) #plot predicted values against the true value
+```
+
+```{r}
+sqrt(mean((test_82$num_of_transactions - test_82$fc3)^2))#calculate RMSE of the model
+```
+
+
+From the result we can see the missing values have a large impact of the VAR model and we cannot yield successful results. There may be a need to impute the values in a more robust way in order to get good forecasts.
+
+
+## 7. Prophet
+
+```{r}
+library(prophet)
+```
+
+```{r}
+data <- readr::read_csv('transaction_data.csv', show_col_types = FALSE)
+data[,c('Date','num_of_transactions')] %>%
+  as_tsibble(index = Date) -> trans_data
+
+#training and testing split(80:20)
+
+trans_data %>%
+  filter(year(Date) >= 2020 ) -> trans_data
+
+trans_data %>%
+  filter(Date < '2023-03-15') -> train_82
+
+trans_data %>%
+  filter(Date >= '2023-03-15') -> test_82
+
+nrow(trans_data)
+nrow(train_82)
+nrow(test_82)
+```
+
+
+```{r}
+df<-train_82
+colnames(df)<- c('ds','y')
+df=arrange(df,ds)
+head(df)
+```
+
+```{r}
+m<-prophet(df)
+```
+
+
+```{r}
+future <- make_future_dataframe(m, periods = 292) #forecast up to 2023-12-31
+tail(future)
+forecast <- predict(m, future)
+tail(forecast[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')])
+plot(m, forecast)
+```
+
+```{r}
+forecast %>% filter(ds>='2023-03-15') ->fc
+test_82$fc <- fc$yhat
+```
+
+```{r}
+test_82 %>% autoplot(fc, col='red')+autolayer(test_82, num_of_transactions) #plot predicted values against the true value
+```
+
+```{r}
+sqrt(mean((test_82$num_of_transactions - test_82$fc)^2))#calculate RMSE of the model
+```
+
+
+## 8. XGB
+
+```{r}
+# Helper packages
+library(dplyr)    # for general data wrangling needs
+
+# Modeling packages
+library(gbm)      # for original implementation of regular and stochastic GBMs
+library(h2o)      # for a java-based implementation of GBM variants
+library(xgboost)  # for fitting extreme gradient boosting
+```
+
+Extract the year, month, day, day of the week, and quarter information from the date. This information will support the gradient-boosting algorithm. First, we built the Basic Gradient Boosting Machine. The acquisition of hyperparameter values follows a tuning strategy of alternating optimization. Then the obtained optimal learning rate, the depth of trees, and the minimum node size will be used to fit a Stochastic GBM. Based on the optimal Stochastic GBM, we introduced multiple regularization parameters and obtained the optimal Extreme gradient boosting (XGBoost). The cross-validation RMSE decreases in each step, which means the algorithm is effective in handling this regression problem.
+
+The cross-validation RMSE of the final XGBoost is 136.8373. The RMSE of the testing set is 131.0633. The test RMSE of XGBoost is smaller than the ARIMA models. It may be because the XGBoost uses more information, such as rainfall and the number of transactions from other channels. In real life, we can't obtain the actual values of these variables. That means the test RMSE is smaller than the actual RMSE of the future forecast since we don't consider the uncertainty of some of the predictors. We can forecast these variables first based on historical data, and the predicted values of these predictors are better obtained and more stable. Then we can use them to forecast the number of online transactions through XGBoost.
+
+The success of XGBoost proves the potential of this algorithm in time series forecasting. We can combine XGBoost and ARIMA to generate more accurate forecasts.
+
+
+
+
+### More date info
+
+### Data preprocessing
+
+```{r}
+transaction_data<-readr::read_csv('transaction_data.csv')
+transaction_data
+```
+```{r}
+library(lubridate)
+# day of week = 1 means Sunday
+transaction_data$Exact_weekday<-wday(transaction_data$Date,label = FALSE)
+
+transaction_data$Year<-lubridate::year(transaction_data$Date)
+
+transaction_data$Quarter<-lubridate::quarter(transaction_data$Date)
+
+transaction_data$Month<- lubridate::month(transaction_data$Date)
+
+transaction_data$Day<-lubridate::day(transaction_data$Date)
+
+transaction_data
+```
+
+```{r}
+trans <- transaction_data %>% filter(Year>=2020)
+head(trans)
+tail(trans)
+summary(trans)
+```
+
+```{r}
+train_set<-trans[1:1169,]
+test_set<-trans[1170:1461,]
+
+tail(train_set)
+head(test_set)
+tail(test_set)
+```
+
+
+```{r}
+feed_train_data<-train_set
+feed_train_data<-feed_train_data[,-1]
+feed_train_data<-feed_train_data %>% 
+  as_tsibble(index = Date)
+#fit the benchmark models
+rain_fit_test <- feed_train_data %>%
+  model(rain = SNAIVE(daily_rain))
+min_temp_fit_test <- feed_train_data %>%
+  model(SNAIVE(min_temp))
+max_temp_fit_test = feed_train_data %>%
+  model(SNAIVE(max_temp))
+avg_temp_fit_test = feed_train_data %>%
+  model(SNAIVE(avg_temp))
+CSC_fit_test<-feed_train_data %>%
+  model(SNAIVE(CSC_num_of_trans))
+QPS_fit_test = feed_train_data %>%
+  model(SNAIVE(QPS_num_of_trans))
+Other_fit_test =feed_train_data %>%
+  model(SNAIVE(Other_num_of_trans))
+
+# forecast on the test data
+Test_rain <- rain_fit_test %>%
+  forecast(h=292)
+Test_min_temp <- min_temp_fit_test %>%
+  forecast(h=292)
+Test_max_temp <- max_temp_fit_test %>%
+  forecast(h=292)
+Test_avg_temp <- avg_temp_fit_test %>%
+  forecast(h=292)
+Test_CSC <- CSC_fit_test %>%
+  forecast(h=292)
+Test_QPS <- QPS_fit_test %>%
+  forecast(h=292)
+Test_Other <- Other_fit_test %>%
+  forecast(h=292)
+```
+
+```{r}
+test_set$daily_rain<-Test_rain$.mean
+test_set$min_temp<-Test_min_temp$.mean
+test_set$max_temp<-Test_max_temp$.mean
+test_set$avg_temp<-Test_avg_temp$.mean
+test_set$CSC_num_of_trans<-Test_CSC$.mean
+test_set$QPS_num_of_trans<-Test_QPS$.mean
+test_set$Other_num_of_trans<-Test_Other$.mean
+```
+
+```{r}
+train_set_data<-train_set[,c(-1)]
+train_set_data$Date<-as.integer(train_set_data$Date)
+train_set_data
+
+test_set_data<-test_set[,c(-1)]
+test_set_data$Date<-as.integer(test_set_data$Date)
+test_set_data
+```
+
+
+
+### Basic GBM
+
+**Choose a relatively high learning rate 0.1, and determine the optimum number of trees for this learning rate.**
+
+```{r}
+# run a basic GBM model
+set.seed(123)  # for reproducibility
+trans_data_gbm <- gbm(
+  formula = num_of_transactions~ .,
+  data = train_set_data,
+  distribution = "gaussian",  # SSE loss function
+  n.trees = 5000,
+  shrinkage = 0.1,
+  interaction.depth = 3,
+  n.minobsinnode = 10,
+  cv.folds = 10
+)
+
+# find index for number trees with minimum CV error
+best <- which.min(trans_data_gbm$cv.error)
+
+# get MSE and compute RMSE
+sqrt(trans_data_gbm$cv.error[best])
+```
+
+```{r}
+# plot error curve
+gbm.perf(trans_data_gbm, method = "cv")
+```
+
+**Fix tree hyperparameters and tune learning rate and assess speed vs. performance.**
+
+```{r}
+# create grid search
+hyper_grid <- expand.grid(
+  learning_rate = c(0.3, 0.1, 0.05, 0.01, 0.005),
+  RMSE = NA,
+  trees = NA,
+  Time = NA
+)
+
+# execute grid search
+for(i in seq_len(nrow(hyper_grid))) {
+
+  # fit gbm
+  set.seed(123)  # for reproducibility
+  train_time <- system.time({
+    m <- gbm(
+      formula = num_of_transactions ~ .,
+      data = train_set_data,
+      distribution = "gaussian",
+      n.trees = 8000, 
+      shrinkage = hyper_grid$learning_rate[i], 
+      interaction.depth = 3, 
+      n.minobsinnode = 10,
+      cv.folds = 10
+   )
+  })
+  
+  # add SSE, trees, and training time to results
+  hyper_grid$RMSE[i]  <- sqrt(min(m$cv.error))
+  hyper_grid$trees[i] <- which.min(m$cv.error)
+  hyper_grid$Time[i]  <- train_time[["elapsed"]]
+
+}
+
+# results
+arrange(hyper_grid, RMSE)
+```
+
+**Set our learning rate at the optimal level (0.01) and tune the tree specific hyperparameters **
+
+```{r}
+# search grid
+hyper_grid <- expand.grid(
+  n.trees = 8000,
+  shrinkage = 0.01,
+  interaction.depth = c(3, 5, 7),
+  n.minobsinnode = c(5, 10, 15)
+)
+
+# create model fit function
+model_fit <- function(n.trees, shrinkage, interaction.depth, n.minobsinnode) {
+  set.seed(123)
+  m <- gbm(
+    formula = num_of_transactions ~ .,
+    data = train_set_data,
+    distribution = "gaussian",
+    n.trees = n.trees,
+    shrinkage = shrinkage,
+    interaction.depth = interaction.depth,
+    n.minobsinnode = n.minobsinnode,
+    cv.folds = 10
+  )
+  # compute RMSE
+  sqrt(min(m$cv.error))
+}
+
+# perform search grid with functional programming
+hyper_grid$rmse <- purrr::pmap_dbl(
+  hyper_grid,
+  ~ model_fit(
+    n.trees = ..1,
+    shrinkage = ..2,
+    interaction.depth = ..3,
+    n.minobsinnode = ..4
+    )
+)
+
+# results
+arrange(hyper_grid, rmse)
+```
+**Fix tree hyperparameters as the result shown above （interaction.depth = 7, n.minobsinnode = 15,）and tune learning rate and assess speed vs. performance.**
+
+```{r}
+# create grid search
+hyper_grid <- expand.grid(
+  learning_rate = c(0.3, 0.1, 0.05, 0.01, 0.005),
+  RMSE = NA,
+  trees = NA,
+  Time = NA
+)
+
+# execute grid search
+for(i in seq_len(nrow(hyper_grid))) {
+
+  # fit gbm
+  set.seed(123)  # for reproducibility
+  train_time <- system.time({
+    m <- gbm(
+      formula = num_of_transactions ~ .,
+      data = train_set_data,
+      distribution = "gaussian",
+      n.trees = 8000, 
+      shrinkage = hyper_grid$learning_rate[i], 
+      interaction.depth = 7, 
+      n.minobsinnode = 15,
+      cv.folds = 10 
+   )
+  })
+  
+  # add SSE, trees, and training time to results
+  hyper_grid$RMSE[i]  <- sqrt(min(m$cv.error))
+  hyper_grid$trees[i] <- which.min(m$cv.error)
+  hyper_grid$Time[i]  <- train_time[["elapsed"]]
+
+}
+
+# results
+arrange(hyper_grid, RMSE)
+```
+
+
+**Set our learning rate at the optimal level (0.01) and tune the tree specific hyperparameters **
+```{r}
+# search grid
+hyper_grid <- expand.grid(
+  n.trees = 8000,
+  shrinkage = 0.01,
+  interaction.depth = c( 3,5,7,8),
+  n.minobsinnode = c(5,10,12,15)
+)
+
+# create model fit function
+model_fit <- function(n.trees, shrinkage, interaction.depth, n.minobsinnode) {
+  set.seed(123)
+  m <- gbm(
+    formula = num_of_transactions ~ .,
+    data = train_set_data,
+    distribution = "gaussian",
+    n.trees = n.trees,
+    shrinkage = shrinkage,
+    interaction.depth = interaction.depth,
+    n.minobsinnode = n.minobsinnode,
+    cv.folds = 10
+  )
+  # compute RMSE
+  sqrt(min(m$cv.error))
+}
+
+# perform search grid with functional programming
+hyper_grid$rmse <- purrr::pmap_dbl(
+  hyper_grid,
+  ~ model_fit(
+    n.trees = ..1,
+    shrinkage = ..2,
+    interaction.depth = ..3,
+    n.minobsinnode = ..4
+    )
+)
+
+# results
+arrange(hyper_grid, rmse)
+```
+
+
+**Fix tree hyperparameters as the result shown above （interaction.depth = 8, n.minobsinnode = 15,）and tune learning rate and assess speed vs. performance.**
+
+```{r}
+# create grid search
+hyper_grid <- expand.grid(
+  learning_rate = c(0.3, 0.1, 0.05, 0.01, 0.005),
+  RMSE = NA,
+  trees = NA,
+  Time = NA
+)
+
+# execute grid search
+for(i in seq_len(nrow(hyper_grid))) {
+
+  # fit gbm
+  set.seed(123)  # for reproducibility
+  train_time <- system.time({
+    m <- gbm(
+      formula = num_of_transactions ~ .,
+      data = train_set_data,
+      distribution = "gaussian",
+      n.trees = 8000, 
+      shrinkage = hyper_grid$learning_rate[i], 
+      interaction.depth = 8, 
+      n.minobsinnode = 15,
+      cv.folds = 10 
+   )
+  })
+  
+  # add SSE, trees, and training time to results
+  hyper_grid$RMSE[i]  <- sqrt(min(m$cv.error))
+  hyper_grid$trees[i] <- which.min(m$cv.error)
+  hyper_grid$Time[i]  <- train_time[["elapsed"]]
+
+}
+
+# results
+arrange(hyper_grid, RMSE)
+```
+
+
+
+
+```{r}
+set.seed(123)  # for reproducibility
+gbm_basic <- gbm(
+  formula = num_of_transactions ~ .,
+  data = train_set_data,
+  distribution = "gaussian",  # SSE loss function
+  n.trees = 5000,
+  shrinkage = 0.01,
+  interaction.depth = 8,
+  n.minobsinnode = 15,
+  cv.folds = 10
+)
+
+gbm.rmse <- sqrt(min(gbm_basic$cv.error))
+gbm.rmse
+```
+
+```{r}
+# variable importance plot
+vip::vip(gbm_basic)
+```
+### Sto. GBM
+
+```{r}
+h2o.init(max_mem_size = "10g")
+
+train_h2o <- as.h2o(train_set_data)
+response <- "num_of_transactions"
+predictors <- setdiff(colnames(train_set_data), response)
+predictors
+```
+
+
+```{r}
+
+# refined hyperparameter grid
+hyper_grid <- list(
+  sample_rate = c(0.5, 0.75, 1),              # row subsampling
+  col_sample_rate = c(0.5, 0.75, 1),          # col subsampling for each split
+  col_sample_rate_per_tree = c(0.5, 0.75, 1)  # col subsampling for each tree
+)
+
+# random grid search strategy
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "mse",
+  stopping_tolerance = 0.001,   
+  stopping_rounds = 10,         
+  max_runtime_secs = 60*60      
+)
+
+# perform grid search 
+grid <- h2o.grid(
+  algorithm = "gbm",
+  grid_id = "gbm_grid",
+  x = predictors, 
+  y = response,
+  training_frame = train_h2o,
+  hyper_params = hyper_grid,
+  ntrees = 6000,
+  learn_rate = 0.01,
+  max_depth = 8,
+  min_rows = 15,
+  nfolds = 10,
+  stopping_rounds = 10,
+  stopping_tolerance = 0,
+  search_criteria = search_criteria,
+  seed = 123
+)
+
+# collect the results and sort by our model performance metric of choice
+grid_perf <- h2o.getGrid(
+  grid_id = "gbm_grid", 
+  sort_by = "mse", 
+  decreasing = FALSE
+)
+
+grid_perf
+```
+
+
+
+```{r}
+# Grab the model_id for the top model, chosen by cross validation error
+best_model_id <- grid_perf@model_ids[[1]]
+best_model <- h2o.getModel(best_model_id)
+
+# Now let’s get performance metrics on the best model
+h2o.performance(model = best_model, xval = TRUE)
+```
+
+```{r}
+# refined hyperparameter grid
+hyper_grid <- list(
+  sample_rate = c(0.5,0.75,1),              # row subsampling
+  col_sample_rate = c( 0.75, 0.85,1),          # col subsampling for each split
+  col_sample_rate_per_tree = c(0.35,0.5, 0.65)  # col subsampling for each tree
+)
+
+# random grid search strategy
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  stopping_metric = "mse",
+  stopping_tolerance = 0.001,   
+  stopping_rounds = 10,
+  max_runtime_secs = 60*60 
+)
+
+# perform grid search 
+grid <- h2o.grid(
+  algorithm = "gbm",
+  grid_id = "gbm_grid",
+  x = predictors, 
+  y = response,
+  training_frame = train_h2o,
+  hyper_params = hyper_grid,
+  ntrees = 6000,
+  learn_rate = 0.01,
+  max_depth = 8,
+  min_rows = 15,
+  nfolds = 10,
+  stopping_rounds = 10,
+  stopping_tolerance = 0,
+  search_criteria = search_criteria,
+  seed = 123
+)
+
+# collect the results and sort by our model performance metric of choice
+grid_perf <- h2o.getGrid(
+  grid_id = "gbm_grid", 
+  sort_by = "mse", 
+  decreasing = FALSE
+)
+
+grid_perf
+```
+
+```{r}
+# Grab the model_id for the top model, chosen by cross validation error
+best_model_id <- grid_perf@model_ids[[1]]
+best_model <- h2o.getModel(best_model_id)
+
+# Now let’s get performance metrics on the best model
+h2o.performance(model = best_model, xval = TRUE)
+```
+The improvement of performance is negliable.
+
+### XGBoost
+
+```{r}
+library(recipes)
+xgb_prep <- recipe(num_of_transactions ~ ., data = train_set_data) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = train_set_data, retain = TRUE) %>%
+  juice()
+
+X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "num_of_transactions")])
+Y <- xgb_prep$num_of_transactions
+```
+
+
+```{r}
+set.seed(123)
+trans_xgb <- xgb.cv(
+  data = X,
+  label = Y,
+  nrounds = 6000,
+  objective = "reg:squarederror",
+  early_stopping_rounds = 50, 
+  nfold = 10,
+  params = list(
+    eta = 0.01,
+    max_depth = 8,
+    min_child_weight = 15,
+    subsample = 0.5,
+    colsample_bynode = 0.85,
+    colsample_bytree = 0.35),
+  verbose = 0
+)  
+
+# minimum test CV RMSE
+min(trans_xgb$evaluation_log$test_rmse_mean)
+```
+
+```{r}
+# hyperparameter grid
+hyper_grid <- expand.grid(
+  eta = 0.01,
+  max_depth = 8, 
+  min_child_weight = 15,
+  subsample = 0.5, 
+  colsample_bynode = 0.85,
+  colsample_bytree = 0.35,
+  gamma = c(0, 1, 10, 100, 1000),
+  lambda = c(0, 1e-2, 0.1, 1, 100, 1000, 10000),
+  alpha = c(0, 1e-2, 0.1, 1, 100, 1000, 10000),
+  rmse = 0,          # a place to dump RMSE results
+  trees = 0          # a place to dump required number of trees
+)
+
+# grid search
+for(i in seq_len(nrow(hyper_grid))) {
+  set.seed(123)
+  m <- xgb.cv(
+    data = X,
+    label = Y,
+    nrounds = 4000,
+    objective = "reg:squarederror",
+    early_stopping_rounds = 50, 
+    nfold = 10,
+    verbose = 0,
+    params = list( 
+      eta = hyper_grid$eta[i], 
+      max_depth = hyper_grid$max_depth[i],
+      min_child_weight = hyper_grid$min_child_weight[i],
+      subsample = hyper_grid$subsample[i],
+      colsample_bytree = hyper_grid$colsample_bytree[i],
+      gamma = hyper_grid$gamma[i], 
+      lambda = hyper_grid$lambda[i], 
+      alpha = hyper_grid$alpha[i]
+    ) 
+  )
+  hyper_grid$rmse[i] <- min(m$evaluation_log$test_rmse_mean)
+  hyper_grid$trees[i] <- m$best_iteration
+}
+
+# results
+hyper_grid %>%
+  filter(rmse > 0) %>%
+  arrange(rmse) %>%
+  glimpse()
+```
+```{r}
+# hyperparameter grid
+hyper_grid <- expand.grid(
+  eta = 0.01,
+  max_depth = 8, 
+  min_child_weight = 15,
+  subsample = 0.5, 
+  colsample_bynode = 0.85,
+  colsample_bytree = 0.35,
+  gamma = c(0, 1, 10, 100, 1000),
+  lambda = c(0, 1e-2,5e-2, 0.1, 0.5, 1),
+  alpha = c(100, 200, 500, 800,1000),
+  rmse = 0,          # a place to dump RMSE results
+  trees = 0          # a place to dump required number of trees
+)
+
+# grid search
+for(i in seq_len(nrow(hyper_grid))) {
+  set.seed(123)
+  m <- xgb.cv(
+    data = X,
+    label = Y,
+    nrounds = 4000,
+    objective = "reg:squarederror",
+    early_stopping_rounds = 50, 
+    nfold = 10,
+    verbose = 0,
+    params = list( 
+      eta = hyper_grid$eta[i], 
+      max_depth = hyper_grid$max_depth[i],
+      min_child_weight = hyper_grid$min_child_weight[i],
+      subsample = hyper_grid$subsample[i],
+      colsample_bytree = hyper_grid$colsample_bytree[i],
+      gamma = hyper_grid$gamma[i], 
+      lambda = hyper_grid$lambda[i], 
+      alpha = hyper_grid$alpha[i]
+    ) 
+  )
+  hyper_grid$rmse[i] <- min(m$evaluation_log$test_rmse_mean)
+  hyper_grid$trees[i] <- m$best_iteration
+}
+
+# results
+hyper_grid %>%
+  filter(rmse > 0) %>%
+  arrange(rmse) %>%
+  glimpse()
+```
+
+learing rate = 0.01
+max depth of the trees = 8
+min node size = 15
+subsample = 0.5
+column sample by split = 0.85
+column sample by tree = 0.35
+gamma = 10
+lambda = 0.5
+alpha = 500
+cross-validation rmse = 136.7740
+
+The reduction on cross-validation rmse is negligible. we can stop tuning and fit the final model.
+
+```{r}
+# optimal parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 8,
+  min_child_weight = 15,
+  subsample = 0.5,
+  colsample_bynode = 0.85,
+  colsample_bytree = 0.35,
+  gamma = 10,
+  lambda = 0.5,
+  alpha = 500
+)
+
+# train final model
+ xgb.fit.final<- xgboost(
+  params = params,
+  data = X,
+  label = Y,
+  nrounds = 4000,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+```
+
+
+### Feature interpretation
+
+```{r}
+vip::vip(xgb.fit.final) 
+```
+
+Top most important variables based on the impurity (gain) metric.
+
+### PDP
+
+```{r}
+partial(xgb.fit.final, 
+        pred.var = "CSC_num_of_trans", 
+        ice = TRUE, center = TRUE, plot = TRUE, rug = TRUE, 
+        alpha = 500, gamma = 10,lambda = 0.5, 
+        plot.engine ="ggplot2",type = "regression", train = X)
+
+partial(xgb.fit.final, 
+        pred.var = "Date", 
+        ice = TRUE, center = TRUE, plot = TRUE, rug = TRUE, 
+        alpha = 500, gamma = 10,lambda = 0.5, 
+        plot.engine ="ggplot2",type = "regression", train = X)
+
+partial(xgb.fit.final, 
+        pred.var = "Exact_weekday", 
+        ice = TRUE, center = TRUE, plot = TRUE, rug = TRUE, 
+        alpha = 500, gamma = 10,lambda = 0.5, 
+        plot.engine ="ggplot2",type = "regression", train = X)
+```
+
+
+### Test
+
+```{r}
+xgb_prep_test <- recipe(num_of_transactions ~ ., data = test_set_data) %>%
+  step_integer(all_nominal()) %>%
+  prep(testing = test_set_data, retain = TRUE) %>%
+  juice()
+
+X_test <- as.matrix(xgb_prep_test[setdiff(names(xgb_prep_test), "num_of_transactions")])
+Y_test <- xgb_prep_test$num_of_transactions
+```
+
+
+```{r}
+prediction <- predict(xgb.fit.final, X_test)
+test_rmse <- sqrt(mean((test_set_data$num_of_transactions- prediction)^2))
+test_rmse
+```
+
+test_rmse=161.7908
+
+
+### Future forcast
+```{r}
+feed_data<-trans
+feed_data<-feed_data[,-1]
+feed_data<-feed_data %>% 
+  as_tsibble(index = Date)
+#fit the benchmark models
+rain_fit <- feed_data %>%
+  model(rain = SNAIVE(daily_rain))
+min_temp_fit <- feed_data %>%
+  model(SNAIVE(min_temp))
+max_temp_fit = feed_data %>%
+  model(SNAIVE(max_temp))
+avg_temp_fit = feed_data %>%
+  model(SNAIVE(avg_temp))
+CSC_fit<-feed_data %>%
+  model(SNAIVE(CSC_num_of_trans))
+QPS_fit = feed_data %>%
+  model(SNAIVE(QPS_num_of_trans))
+Other_fit =feed_data %>%
+  model(SNAIVE(Other_num_of_trans))
+
+# forecast on the test data
+Future_rain <- rain_fit %>%
+  forecast(h=366)
+Future_min_temp <- min_temp_fit %>%
+  forecast(h=366)
+Future_max_temp <- max_temp_fit %>%
+  forecast(h=366)
+Future_avg_temp <- avg_temp_fit %>%
+  forecast(h=366)
+Future_CSC <- CSC_fit %>%
+  forecast(h=366)
+Future_QPS <- QPS_fit %>%
+  forecast(h=366)
+Future_Other <- Other_fit %>%
+  forecast(h=366)
+
+```
+
+```{r}
+Future_data<-data.frame(Date=Future_rain$Date)
+Future_data$daily_rain<-Future_rain$.mean
+Future_data$min_temp<-Future_min_temp$.mean
+Future_data$max_temp<-Future_max_temp$.mean
+Future_data$avg_temp<-Future_avg_temp$.mean
+Future_data$weekday<- !weekdays(Future_data$Date) %in% c("Saturday", "Sunday")
+Future_data$weekday<-Future_data$weekday%>%as.numeric()
+Future_data$CSC_num_of_trans<-Future_CSC$.mean
+Future_data$QPS_num_of_trans<-Future_QPS$.mean
+Future_data$Other_num_of_trans<-Future_Other$.mean
+```
+
+```{r}
+library(lubridate)
+# day of week = 1 means Sunday
+Future_data$Exact_weekday<-wday(Future_data$Date,label = FALSE)
+
+Future_data$Year<-lubridate::year(Future_data$Date)
+
+Future_data$Quarter<-lubridate::quarter(Future_data$Date)
+
+Future_data$Month<- lubridate::month(Future_data$Date)
+
+Future_data$Day<-lubridate::day(Future_data$Date)
+
+Future_data$Date<-Future_data$Date%>%as.integer()
+```
+
+```{r}
+X_future<-as.matrix(Future_data)
+forecast <- predict(xgb.fit.final, X_future)
+Future_data$num_of_transactions<-forecast 
+num_cols <- ncol(Future_data)
+num_of_transactions <- Future_data[, num_cols]
+Future_data <- cbind(Date=Future_data[, 1], num_of_transactions, Future_data[, 2:(num_cols-1)])
+```
+
+```{r}
+pre_data<-feed_data%>%as.data.frame()
+Future_fc<-rbind(pre_data,Future_data)
+Future_fc$Date<-Future_fc$Date%>%as.Date()
+tail(Future_fc)
+
+total_data<-Future_fc %>% 
+  as_tsibble(index = Date)
+total_data%>%autoplot(num_of_transactions)
+
+fc_summary<-total_data%>%filter(Year>=2024)%>%select(num_of_transactions)
+summary(fc_summary)
+```
+
+
+## 9 Cross-Validation on best-performed models
+
+From our previous results, apart from XGBoost, SNAIVE, ETS and ARIMA performed the best among other models, but their RMSE on test set are quite similar. To better evaluate the models, we further performed Cross-validation on these candidates.
+
+```{r}
+data <- readr::read_csv('transaction_data.csv', show_col_types = FALSE)
+data %>% as_tsibble(index = Date) -> trans_data
+trans_data %>%
+  filter(year(Date) >= 2020 ) -> trans_data
+```
+
+```{r}
+trans_data_tr <- trans_data |>
+  stretch_tsibble(.init = 365, .step = 30) #train step set to 365 and test step as 30
+```
+```{r}
+trans_data %>%
+  filter(Date < '2023-03-15') -> train_82
+trans_data %>%
+  filter(Date >= '2023-03-15') -> test_82
+nrow(train_82)
+nrow(test_82)
+```
+
+```{r}
+#retrieve the lambda from above
+lambda <- train_82 |>
+  features(num_of_transactions, features = guerrero) |>
+  pull(lambda_guerrero)
+```
+
+```{r warning=FALSE}
+trans_data_tr %>%
+  model(SNAIVE=SNAIVE(num_of_transactions), 
+        ETS=ETS(num_of_transactions),
+        ARIMA_SELF=ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(3,0,0)+PDQ(0,1,2)),
+        ARIMA_AUTO=ARIMA(box_cox(num_of_transactions, lambda) ~ 0+pdq(2,0,2)+PDQ(0,1,1)),
+        ARIMA_HARMONIC=ARIMA(box_cox(num_of_transactions, lambda) ~ 0+fourier(K = 3) + pdq(3,1,1)+PDQ(1,0,0))
+        ) %>%
+  forecast(h = 30) %>%
+  accuracy(trans_data) %>% arrange(RMSE)
+```
+
+By comparing the CV RMSE, we can see that the ARIMA model with fourier terms is performing the best among the candidates.\\
+
+## 10. Final model & forecast
+
+### 10.1 Dynamic regression final model+Dynamic regression 2024 forecast
+
+```{r}
+trans_data %>% model(ARIMA(box_cox(num_of_transactions, lambda) ~ 0+fourier(K = 3) + pdq(3,1,1)+PDQ(1,0,0)))%>%forecast(h=366)->fcarima
+fcarima%>% autoplot()
+fcarima %>%autoplot()+autolayer(trans_data, num_of_transactions)
+```
+
+
+### 10.2 XGBoost final model+XGBoost2024forecast
+```{r}
+# optimal parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 8,
+  min_child_weight = 15,
+  subsample = 0.5,
+  colsample_bynode = 0.85,
+  colsample_bytree = 0.35,
+  gamma = 10,
+  lambda = 0.5,
+  alpha = 500
+)
+
+# train final model
+ xgb.fit.final<- xgboost(
+  params = params,
+  data = X,
+  label = Y,
+  nrounds = 4000,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+```
+
+
+```{r}
+feed_data<-trans
+feed_data<-feed_data[,-1]
+feed_data<-feed_data %>% 
+  as_tsibble(index = Date)
+#fit the benchmark models
+rain_fit <- feed_data %>%
+  model(rain = SNAIVE(daily_rain))
+min_temp_fit <- feed_data %>%
+  model(SNAIVE(min_temp))
+max_temp_fit = feed_data %>%
+  model(SNAIVE(max_temp))
+avg_temp_fit = feed_data %>%
+  model(SNAIVE(avg_temp))
+CSC_fit<-feed_data %>%
+  model(SNAIVE(CSC_num_of_trans))
+QPS_fit = feed_data %>%
+  model(SNAIVE(QPS_num_of_trans))
+Other_fit =feed_data %>%
+  model(SNAIVE(Other_num_of_trans))
+
+# forecast on the test data
+Future_rain <- rain_fit %>%
+  forecast(h=366)
+Future_min_temp <- min_temp_fit %>%
+  forecast(h=366)
+Future_max_temp <- max_temp_fit %>%
+  forecast(h=366)
+Future_avg_temp <- avg_temp_fit %>%
+  forecast(h=366)
+Future_CSC <- CSC_fit %>%
+  forecast(h=366)
+Future_QPS <- QPS_fit %>%
+  forecast(h=366)
+Future_Other <- Other_fit %>%
+  forecast(h=366)
+
+```
+
+```{r}
+Future_data<-data.frame(Date=Future_rain$Date)
+Future_data$daily_rain<-Future_rain$.mean
+Future_data$min_temp<-Future_min_temp$.mean
+Future_data$max_temp<-Future_max_temp$.mean
+Future_data$avg_temp<-Future_avg_temp$.mean
+Future_data$weekday<- !weekdays(Future_data$Date) %in% c("Saturday", "Sunday")
+Future_data$weekday<-Future_data$weekday%>%as.numeric()
+Future_data$CSC_num_of_trans<-Future_CSC$.mean
+Future_data$QPS_num_of_trans<-Future_QPS$.mean
+Future_data$Other_num_of_trans<-Future_Other$.mean
+```
+
+```{r}
+library(lubridate)
+# day of week = 1 means Sunday
+Future_data$Exact_weekday<-wday(Future_data$Date,label = FALSE)
+
+Future_data$Year<-lubridate::year(Future_data$Date)
+
+Future_data$Quarter<-lubridate::quarter(Future_data$Date)
+
+Future_data$Month<- lubridate::month(Future_data$Date)
+
+Future_data$Day<-lubridate::day(Future_data$Date)
+
+Future_data$Date<-Future_data$Date%>%as.integer()
+```
+
+```{r}
+X_future<-as.matrix(Future_data)
+forecast <- predict(xgb.fit.final, X_future)
+Future_data$num_of_transactions<-forecast 
+num_cols <- ncol(Future_data)
+num_of_transactions <- Future_data[, num_cols]
+Future_data <- cbind(Date=Future_data[, 1], num_of_transactions, Future_data[, 2:(num_cols-1)])
+```
+
+```{r}
+pre_data<-feed_data%>%as.data.frame()
+Future_fc<-rbind(pre_data,Future_data)
+Future_fc$Date<-Future_fc$Date%>%as.Date()
+tail(Future_fc)
+
+total_data<-Future_fc %>% 
+  as_tsibble(index = Date)
+total_data%>%autoplot(num_of_transactions)
+
+fc_summary<-total_data%>%filter(Year>=2024)%>%select(num_of_transactions)
+summary(fc_summary)
+```
+
+
+
+
